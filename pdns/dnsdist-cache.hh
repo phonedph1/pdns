@@ -39,6 +39,7 @@ public:
   void expunge(size_t upTo=0);
   void expungeByName(const DNSName& name, uint16_t qtype=QType::ANY, bool suffixMatch=false);
   bool isFull();
+  std::unordered_map<unsigned int, vector<boost::variant<string,double>>> cacheInsTable(unsigned int top, unsigned int labels);
   string toString();
   uint64_t getSize();
   uint64_t getHits() const { return d_hits; }

@@ -225,6 +225,8 @@ static counts_t exceedRespByterate(unsigned int rate, int seconds)
 
 void setupLuaInspection()
 {
+  g_lua.executeCode(R"(function topCacheSuffix(pool, top, labels) pool = pool or ""; top = top or 10; for k,v in ipairs(getPool(pool):getCache():cacheInsTable(top,labels)) do show(string.format("%4d  %-40s %4d %4.1f%%",k,v[1],v[2], v[3])) end end)");
+
   g_lua.writeFunction("topClients", [](boost::optional<unsigned int> top_) {
       setLuaNoSideEffect();
       auto top = top_.get_value_or(10);

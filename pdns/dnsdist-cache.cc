@@ -329,6 +329,50 @@ void DNSDistPacketCache::expungeByName(const DNSName& name, uint16_t qtype, bool
   }
 }
 
+std::unordered_map<unsigned int, vector<boost::variant<string,double>>> DNSDistPacketCache::cacheInsTable(unsigned int top, unsigned int labels)
+{
+  map<DNSName, unsigned int> counts;
+  unsigned int total=0;
+
+  if(labels < 1)
+    labels = 1;
+
+  for (uint32_t shardIndex = 0; shardIndex < d_shardCount; shardIndex++) {
+    WriteLock w(&d_shards.at(shardIndex).d_lock);
+    auto& map = d_shards[shardIndex].d_map;
+
+    for(auto it = map.begin(); it != map.end(); ) {
+      const CacheValue& value = it->second;
+      DNSName temp(value.qname);
+      temp.trimToLabels(labels);
+      counts[temp]++;
+      total++;
+      ++it;
+    }
+  }
+
+  vector<pair<unsigned int, DNSName>> rcounts;
+  rcounts.reserve(counts.size());
+  for(const auto& c : counts)
+    rcounts.push_back(make_pair(c.second, c.first.makeLowerCase()));
+
+  sort(rcounts.begin(), rcounts.end(), [](const decltype(rcounts)::value_type& a,
+                                          const decltype(rcounts)::value_type& b) {
+         return b.first < a.first;
+       });
+
+  std::unordered_map<unsigned int, vector<boost::variant<string,double>>> ret;
+  unsigned int count=1, rest=0;
+  for(const auto& rc : rcounts) {
+    if(count==top+1)
+      rest+=rc.first;
+    else
+      ret.insert({count++, {rc.second.toString(), rc.first, 100.0*rc.first/total}});
+  }
+  ret.insert({count, {"Rest", rest, total > 0 ? 100.0*rest/total : 100.0}});
+  return ret;
+}
+
 bool DNSDistPacketCache::isFull()
 {
     return (getSize() >= d_maxEntries);
