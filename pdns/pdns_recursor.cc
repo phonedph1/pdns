@@ -118,7 +118,7 @@ thread_local std::unique_ptr<RecursorPacketCache> t_packetCache;
 thread_local FDMultiplexer* t_fdm{nullptr};
 thread_local std::unique_ptr<addrringbuf_t> t_remotes, t_servfailremotes, t_largeanswerremotes, t_bogusremotes;
 thread_local std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t> > > t_queryring, t_servfailqueryring, t_bogusqueryring;
-thread_local std::shared_ptr<NetmaskGroup> t_allowFrom;
+thread_local std::shared_ptr<NetmaskGroup> t_allowFrom, t_allowNotifyWipe;
 #ifdef HAVE_PROTOBUF
 thread_local std::unique_ptr<boost::uuids::random_generator> t_uuidGenerator;
 #endif
@@ -179,7 +179,7 @@ static set<int> g_fromtosockets; // listen sockets that use 'sendfromto()' mecha
 static vector<ComboAddress> g_localQueryAddresses4, g_localQueryAddresses6;
 static AtomicCounter counter;
 static std::shared_ptr<SyncRes::domainmap_t> g_initialDomainMap; // new threads needs this to be setup
-static std::shared_ptr<NetmaskGroup> g_initialAllowFrom; // new thread needs to be setup with this
+static std::shared_ptr<NetmaskGroup> g_initialAllowFrom, g_initialAllowNotifyFrom; // new thread needs to be setup with this
 static NetmaskGroup g_XPFAcl;
 static size_t g_tcpMaxQueriesPerConn;
 static size_t s_maxUDPQueriesPerRound;
@@ -1989,7 +1989,7 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
     */
 #endif
 
-    if(needECS || needXPF || (t_pdl && (t_pdl->d_gettag || t_pdl->d_gettag_ffi))) {
+    if(needECS || needXPF || (t_pdl && (t_pdl->d_gettag || t_pdl->d_gettag_ffi)) || dh->opcode == Opcode::Notify) {
       try {
         EDNSOptionViewMap ednsOptions;
         bool xpfFound = false;
@@ -2093,6 +2093,24 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
       g_stats.avgLatencyUsec=(1-1.0/g_latencyStatSize)*g_stats.avgLatencyUsec + 0.0; // we assume 0 usec
       g_stats.avgLatencyOursUsec=(1-1.0/g_latencyStatSize)*g_stats.avgLatencyOursUsec + 0.0; // we assume 0 usec
       return 0;
+    }
+
+    // not a cache hit
+    if (dh->opcode == Opcode::Notify) {
+      if(!g_quiet) {
+        g_log<<Logger::Notice<<t_id<< " got notify for "<<qname.toLogString()<<" from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<endl;
+      }
+
+      int count=0, pcount=0, countNeg=0;
+      count = broadcastWorkerFunction<uint64_t>(boost::bind(pleaseWipeCache, qname, true));
+      pcount = broadcastWorkerFunction<uint64_t>(boost::bind(pleaseWipePacketCache, qname, true));
+      countNeg = broadcastWorkerFunction<uint64_t>(boost::bind(pleaseWipeAndCountNegCache, qname, true));
+
+      variable = true;
+
+      if(!g_quiet) {
+        g_log<<Logger::Notice<<t_id<< " wiped "<<count<<" records, "<<countNeg<<" negative records, "<<pcount<<" packets for "<<qname.toLogString()<<endl;
+      }
     }
   }
   catch(std::exception& e) {
@@ -2212,7 +2230,7 @@ static void handleNewUDPQuestion(int fd, FDMultiplexer::funcparam_t& var)
             g_log<<Logger::Error<<"Ignoring answer from "<<fromaddr.toString()<<" on server socket!"<<endl;
           }
         }
-        else if(dh->opcode) {
+        else if(dh->opcode && !(dh->opcode == Opcode::Notify && t_allowNotifyWipe && t_allowNotifyWipe->match(&fromaddr))) {
           g_stats.ignoredCount++;
           if(g_logCommonErrors) {
             g_log<<Logger::Error<<"Ignoring non-query opcode "<<dh->opcode<<" from "<<fromaddr.toString()<<" on server socket!"<<endl;
@@ -2800,6 +2818,46 @@ template uint64_t broadcastAccFunction(const boost::function<uint64_t*()>& fun);
 template vector<ComboAddress> broadcastAccFunction(const boost::function<vector<ComboAddress> *()>& fun); // explicit instantiation
 template vector<pair<DNSName,uint16_t> > broadcastAccFunction(const boost::function<vector<pair<DNSName, uint16_t> > *()>& fun); // explicit instantiation
 
+// used to wipe caches on a worker thread
+template<class T> T broadcastWorkerFunction(const boost::function<T*()>& func)
+{
+  T ret=T();
+  unsigned int n = 0;
+  for (const auto& threadInfo : s_threadInfos) {
+    if(n++ == t_id) {
+      ret += *func(); // don't write to ourselves!
+      continue;
+    }
+
+    if(!threadInfo.isWorker) {
+      continue;
+    }
+
+    const auto& tps = threadInfo.pipes;
+    ThreadMSG* tmsg = new ThreadMSG();
+    tmsg->func = boost::bind(voider<T>, func);
+    tmsg->wantAnswer = true;
+
+    if(write(tps.writeToThread, &tmsg, sizeof(tmsg)) != sizeof(tmsg)) {
+      delete tmsg;
+      unixDie("write to thread pipe returned wrong size or error");
+    }
+
+    T* resp = nullptr;
+    if(read(tps.readFromThread, &resp, sizeof(resp)) != sizeof(resp))
+      unixDie("read from thread pipe returned wrong size or error");
+
+    if(resp) {
+      ret += *resp;
+      delete resp;
+      resp = nullptr;
+    }
+  }
+  return ret;
+}
+
+template uint64_t broadcastWorkerFunction(const boost::function<uint64_t*()>& fun); // explicit instantiation
+
 static void handleRCC(int fd, FDMultiplexer::funcparam_t& var)
 {
   string remote;
@@ -3097,9 +3155,10 @@ static void checkOrFixFDS()
 
 static void* recursorThread(unsigned int tid);
 
-static void* pleaseSupplantACLs(std::shared_ptr<NetmaskGroup> ng)
+static void* pleaseSupplantACLs(std::shared_ptr<NetmaskGroup> ngAllow, std::shared_ptr<NetmaskGroup> ngWipe)
 {
-  t_allowFrom = ng;
+  t_allowFrom = ngAllow;
+  t_allowNotifyWipe = ngWipe;
   return nullptr;
 }
 
@@ -3120,6 +3179,7 @@ void parseACLs()
     if(!::arg().preParseFile(configname.c_str(), "allow-from-file"))
       throw runtime_error("Unable to re-parse configuration file '"+configname+"'");
     ::arg().preParseFile(configname.c_str(), "allow-from", LOCAL_NETS);
+    ::arg().preParseFile(configname.c_str(), "allow-notify-wipe", "");
     ::arg().preParseFile(configname.c_str(), "include-dir");
     ::arg().preParse(g_argc, g_argv, "include-dir");
 
@@ -3132,14 +3192,38 @@ void parseACLs()
 	throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
       if(!::arg().preParseFile(fn.c_str(), "allow-from", ::arg()["allow-from"]))
 	throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
+      if(!::arg().preParseFile(fn.c_str(), "allow-notify-wipe", ::arg()["allow-notify-wipe"]))
+        throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
     }
 
     ::arg().preParse(g_argc, g_argv, "allow-from-file");
     ::arg().preParse(g_argc, g_argv, "allow-from");
+    ::arg().preParse(g_argc, g_argv, "allow-notify-wipe");
   }
 
   std::shared_ptr<NetmaskGroup> oldAllowFrom = t_allowFrom;
   std::shared_ptr<NetmaskGroup> allowFrom = std::make_shared<NetmaskGroup>();
+
+  std::shared_ptr<NetmaskGroup> oldAllowNotifyWipe = t_allowNotifyWipe;
+  std::shared_ptr<NetmaskGroup> allowNotifyWipe = std::make_shared<NetmaskGroup>();
+
+  if(!::arg()["allow-notify-wipe"].empty()) {
+    vector<string> ips;
+    stringtok(ips, ::arg()["allow-notify-wipe"], ", ");
+
+    g_log<<Logger::Warning<<"Only allowing notify wipe from: ";
+    for(vector<string>::const_iterator i = ips.begin(); i!= ips.end(); ++i) {
+      allowNotifyWipe->addMask(*i);
+      if(i!=ips.begin())
+        g_log<<Logger::Warning<<", ";
+      g_log<<Logger::Warning<<*i;
+    }
+    g_log<<Logger::Warning<<endl;
+  }
+  else {
+    allowNotifyWipe = nullptr;
+  }
+
 
   if(!::arg()["allow-from-file"].empty()) {
     string line;
@@ -3181,7 +3265,9 @@ void parseACLs()
   }
 
   g_initialAllowFrom = allowFrom;
-  broadcastFunction(boost::bind(pleaseSupplantACLs, allowFrom));
+  g_initialAllowNotifyFrom = allowNotifyWipe;
+  broadcastFunction(boost::bind(pleaseSupplantACLs, allowFrom, allowNotifyWipe));
+  oldAllowNotifyWipe = nullptr;
   oldAllowFrom = nullptr;
 
   l_initialized = true;
@@ -3735,6 +3821,7 @@ try
   SyncRes tmp(g_now); // make sure it allocates tsstorage before we do anything, like primeHints or so..
   SyncRes::setDomainMap(g_initialDomainMap);
   t_allowFrom = g_initialAllowFrom;
+  t_allowNotifyWipe = g_initialAllowNotifyFrom;
   t_udpclientsocks = std::unique_ptr<UDPClientSocks>(new UDPClientSocks());
   t_tcpClientCounts = std::unique_ptr<tcpClientCounts_t>(new tcpClientCounts_t());
   primeHints();
@@ -4006,6 +4093,7 @@ int main(int argc, char **argv)
     ::arg().set("stats-ringbuffer-entries", "maximum number of packets to store statistics for")="10000";
     ::arg().set("version-string", "string reported on version.pdns or version.bind")=fullVersionString();
     ::arg().set("allow-from", "If set, only allow these comma separated netmasks to recurse")=LOCAL_NETS;
+    ::arg().set("allow-notify-wipe", "If set, only allow these comma separated netmasks to trigger notify wipe")="";
     ::arg().set("allow-from-file", "If set, load allowed netmasks from this file")="";
     ::arg().set("entropy-source", "If set, read entropy from this file")="/dev/urandom";
     ::arg().set("dont-query", "If set, do not query these netmasks for DNS data")=DONT_QUERY;
