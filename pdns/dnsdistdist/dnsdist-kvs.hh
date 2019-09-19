@@ -85,7 +85,8 @@ private:
 class KeyValueLookupKeySuffix: public KeyValueLookupKey
 {
 public:
-  KeyValueLookupKeySuffix(size_t minLabels, bool wireFormat): d_minLabels(minLabels), d_wireFormat(wireFormat)
+  KeyValueLookupKeySuffix(size_t minLabels, bool wireFormat): d_minLabels(min
+  , d_wireFormat(wireFormat)
   {
   }
 
@@ -99,7 +100,7 @@ public:
   std::string toString() const override
   {
     if (d_minLabels > 0) {
-      return "suffix " + std::string(d_wireFormat ? "in wire format " : "") + "at least " + std::to_string(d_minLabels) + " labels)";
+      return "suffix " + std::string(d_wireFormat ? "in wire format " : "") + "at least " + std::to_string(d_minLabels) + " label(s)";
     }
     return "suffix" + std::string(d_wireFormat ? " in wire format" : "");
   }
